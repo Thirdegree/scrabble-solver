@@ -1,0 +1,14 @@
+syntax = "proto3";
+package messages;
+enum SolverKind {
+  OUIJA = 0;
+  SCRABBLE = 1;
+}
+//
+message WordRequest {
+  string letters = 1;
+  SolverKind kind = 2;
+}
+message WordsReply {
+    repeated string words = 1;
+}
