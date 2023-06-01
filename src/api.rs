@@ -15,7 +15,7 @@ pub struct Server {
 }
 async fn serve_client(mut socket: TcpStream) {
     let read_buf = &mut [0; 4096];
-    let mut write_dst = [0; 4096];
+    let mut write_dst: Vec<u8> = vec![0; 4096];
     let solver = solver::NaiveSolver::new();
     loop {
         let n = match socket.read(read_buf).await {
@@ -43,20 +43,30 @@ async fn serve_client(mut socket: TcpStream) {
                             solver.valid_words_scrabble(message.letters.chars())
                         }
                     };
-                    let mut write_buf = &mut write_dst[..];
                     let reply = messages::WordsReply { words };
+                    if write_dst.len() < reply.encoded_len() + 10 {
+                        write_dst.resize(reply.encoded_len() + 10, 0);
+                    }
+                    let mut write_buf = &mut write_dst[..];
                     reply.encode_length_delimited(&mut write_buf).unwrap();
-                    match socket
-                        .write(
-                            &write_dst
-                                [..reply.encoded_len() + length_delimiter_len(reply.encoded_len())],
-                        )
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            eprintln!("{e:?}");
-                            return;
+                    let reply_byte_len =
+                        reply.encoded_len() + length_delimiter_len(reply.encoded_len());
+                    let mut written = 0;
+
+                    while written < reply_byte_len {
+                        println!("Writting next {} bytes", reply_byte_len - written);
+                        match socket.write(&write_dst[written..reply_byte_len]).await {
+                            Ok(n) => {
+                                written += n;
+                                eprintln!(
+                                    "Replied with {n} ({written}/{reply_byte_len}) bytes of message of length {}",
+                                    reply.encoded_len()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("{e:?}");
+                                return;
+                            }
                         }
                     }
                 }
@@ -147,6 +157,51 @@ mod test {
                 .collect()
             }
         );
+        serve_task.abort();
+        serve_task.await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_server_reading_very_large_response() {
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let serve_task = tokio::spawn(async move {
+            loop {
+                let (socket, _) = server.accept().await.unwrap();
+                serve_client(socket).await;
+            }
+        });
+        let mut client = TcpStream::connect(addr.to_string()).await.unwrap();
+        let mut dst = [0; 4098];
+        let mut buf = &mut dst[..];
+        let message = messages::WordRequest {
+            letters: "abcdefghijklmnopqrstuvwxyz".to_string(),
+            kind: messages::SolverKind::Ouija.into(),
+        };
+        message.encode_length_delimited(&mut buf).unwrap();
+        let encoded = &dst[..message.encoded_len() + length_delimiter_len(message.encoded_len())];
+        let written = client.write(encoded).await.unwrap();
+        assert!(written >= message.encoded_len() + length_delimiter_len(message.encoded_len()));
+        let mut tot_read = 0;
+        let mut read_buf = vec![0; 3500000];
+        let mut parsed_reply: Option<messages::WordsReply> = None;
+        loop {
+            let reply_len = client.read(&mut read_buf[tot_read..]).await.unwrap();
+            tot_read += reply_len;
+            println!("Got some data ({tot_read})");
+            if let Ok(reply_msg) =
+                messages::WordsReply::decode_length_delimited(&read_buf[..tot_read])
+            {
+                parsed_reply = Some(reply_msg);
+                break;
+            };
+        }
+        let mut words: Vec<String> = include_str!("wordlist.txt")
+            .split('\n')
+            .map(|s| s.to_string())
+            .collect();
+        words.sort();
+        assert_eq!(parsed_reply.unwrap(), messages::WordsReply { words });
         serve_task.abort();
         serve_task.await.unwrap_err();
     }
